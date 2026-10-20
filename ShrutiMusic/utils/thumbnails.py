@@ -1,558 +1,407 @@
-import os
+
+       import os
+import math
 import random
+import traceback
+from pathlib import Path
+
 import aiohttp
 import aiofiles
-import traceback
-import math
-
-from pathlib import Path
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageEnhance
 from py_yt import VideosSearch
 from ShrutiMusic import app
 
-
 CACHE_DIR = Path("cache")
-CACHE_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CANVAS_W, CANVAS_H = 1320, 760
-
 FONT_REGULAR_PATH = "ShrutiMusic/assets/font2.ttf"
 FONT_BOLD_PATH = "ShrutiMusic/assets/font3.ttf"
-DEFAULT_THUMB = str(
-    Path(__file__).resolve().parents[1] / "assets" / "ShrutiBots.jpg"
-)
-)"
+DEFAULT_THUMB = "ShrutiMusic/assets/ShrutiBots.jpg"
+DEFAULT_THUMB_URL = "https://graph.org/file/8900e3ff2d522b0a72fde-85a16f08cdf35e4b93.jpg"
+DEFAULT_THUMB_CACHE = CACHE_DIR / "default_music_thumb.jpg"
 
-BOT_BRAND = "Agni Music"
+# Muted premium palettes; one palette is chosen per generated thumbnail.
+PALETTES = [
+    ((10, 15, 28), (31, 44, 72), (96, 165, 250)),
+    ((15, 12, 24), (55, 35, 76), (192, 132, 252)),
+    ((8, 20, 24), (24, 64, 66), (94, 234, 212)),
+    ((22, 14, 18), (74, 35, 47), (251, 146, 60)),
+    ((12, 15, 20), (42, 48, 62), (226, 232, 240)),
+]
 
 
-def wrap_text(draw, text, font, max_width):
-    words = str(text).split()
+def load_font(path, size):
+    """Load a project font, falling back safely if it is missing."""
+    try:
+        return ImageFont.truetype(path, size=size)
+    except (OSError, IOError):
+        try:
+            return ImageFont.truetype("DejaVuSans-Bold.ttf" if "font3" in path else "DejaVuSans.ttf", size=size)
+        except (OSError, IOError):
+            return ImageFont.load_default()
+
+
+def fit_text(draw, text, font_path, start_size, max_width, min_size=20):
+    """Return a font sized so a single line fits max_width."""
+    size = start_size
+    while size > min_size:
+        font = load_font(font_path, size)
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return font
+        size -= 2
+    return load_font(font_path, min_size)
+
+
+def wrap_text(draw, text, font, max_width, max_lines=2):
+    """Wrap text without allowing it to overflow the information panel."""
+    words = str(text or "").split()
+    if not words:
+        return ["Unknown title"]
+
     lines = []
-    current_line = ""
-
+    current = ""
     for word in words:
-        test_line = current_line + (" " if current_line else "") + word
+        candidate = f"{current} {word}".strip()
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            current = candidate
+            continue
 
-        if draw.textlength(test_line, font=font) <= max_width:
-            current_line = test_line
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word
+        if current:
+            lines.append(current)
+        current = word
 
-    if current_line:
-        lines.append(current_line)
+        if len(lines) >= max_lines:
+            break
 
-    return lines[:2]
+    if current and len(lines) < max_lines:
+        lines.append(current)
 
+    # If text remains after the final allowed line, add an ellipsis.
+    consumed = " ".join(lines).split()
+    if len(consumed) < len(words) and lines:
+        last = lines[-1]
+        while last and draw.textbbox((0, 0), last + "…", font=font)[2] > max_width:
+            last = last[:-1].rstrip()
+        lines[-1] = (last + "…") if last else "…"
 
-def random_gradient():
-    colors = [
-        [(15, 12, 41), (48, 43, 99), (36, 36, 62)],
-        [(10, 10, 10), (35, 35, 40), (20, 20, 25)],
-        [(26, 26, 46), (56, 56, 86), (40, 40, 60)],
-        [(20, 25, 35), (45, 50, 70), (30, 35, 50)],
-        [(12, 17, 30), (38, 43, 65), (25, 30, 45)],
-        [(18, 18, 28), (48, 48, 68), (32, 32, 48)],
-        [(8, 15, 25), (28, 40, 55), (18, 28, 40)],
-        [(22, 22, 35), (52, 52, 75), (35, 35, 55)],
-        [(14, 20, 28), (44, 50, 68), (28, 35, 48)],
-        [(16, 14, 38), (46, 44, 88), (30, 28, 60)],
-    ]
-    return random.choice(colors)
+    return lines[:max_lines]
 
 
-def apply_gradient(canvas, colors):
-    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    for y in range(CANVAS_H):
-        progress = y / CANVAS_H
-
-        if progress < 0.4:
-            t = progress / 0.4
-            start, end = colors[0], colors[1]
-        else:
-            t = (progress - 0.4) / 0.6
-            start, end = colors[1], colors[2]
-
-        r = int(start[0] * (1 - t) + end[0] * t)
-        g = int(start[1] * (1 - t) + end[1] * t)
-        b = int(start[2] * (1 - t) + end[2] * t)
-
-        draw.line(
-            [(0, y), (CANVAS_W, y)],
-            fill=(r, g, b, 255)
-        )
-
-    return Image.alpha_composite(canvas, overlay)
+def make_gradient(size, top, bottom):
+    """Create a vertical RGB gradient."""
+    width, height = size
+    image = Image.new("RGB", size)
+    draw = ImageDraw.Draw(image)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
+        draw.line((0, y, width, y), fill=color)
+    return image.convert("RGBA")
 
 
-def random_layout():
-    layouts = [
-        {
-            "art_size": random.randint(420, 520),
-            "art_x": random.randint(60, 120),
-            "art_shape": random.choice(["circle", "rounded", "diamond"]),
-            "text_align": "right",
-            "accent_style": random.choice(["line", "dot", "wave"]),
-            "show_particles": random.choice([True, False]),
-        },
-        {
-            "art_size": random.randint(400, 500),
-            "art_x": CANVAS_W - random.randint(520, 620),
-            "art_shape": random.choice(["circle", "rounded", "square"]),
-            "text_align": "left",
-            "accent_style": random.choice(["line", "glow", "none"]),
-            "show_particles": random.choice([True, False]),
-        },
-        {
-            "art_size": random.randint(380, 480),
-            "art_x": random.randint(80, 140),
-            "art_shape": random.choice(["circle", "hexagon", "rounded"]),
-            "text_align": "right",
-            "accent_style": random.choice(["dot", "wave", "glow"]),
-            "show_particles": random.choice([True, False]),
-        },
-    ]
-    return random.choice(layouts)
+def cover_crop(image, size):
+    """Scale and center-crop an image to fill a square."""
+    image = image.convert("RGB")
+    target_w, target_h = size
+    ratio = max(target_w / image.width, target_h / image.height)
+    resized = image.resize(
+        (max(1, int(image.width * ratio)), max(1, int(image.height * ratio))),
+        Image.Resampling.LANCZOS,
+    )
+    left = (resized.width - target_w) // 2
+    top = (resized.height - target_h) // 2
+    return resized.crop((left, top, left + target_w, top + target_h)).convert("RGBA")
 
 
-def create_shape_mask(size, shape):
-    mask = Image.new("L", (size, size), 0)
-    draw = ImageDraw.Draw(mask)
-
-    if shape == "circle":
-        draw.ellipse([0, 0, size, size], fill=255)
-
-    elif shape == "rounded":
-        draw.rounded_rectangle(
-            [0, 0, size, size],
-            radius=random.randint(40, 80),
-            fill=255
-        )
-
-    elif shape == "square":
-        draw.rectangle([0, 0, size, size], fill=255)
-
-    elif shape == "diamond":
-        draw.polygon(
-            [
-                (size // 2, 0),
-                (size, size // 2),
-                (size // 2, size),
-                (0, size // 2),
-            ],
-            fill=255
-        )
-
-    elif shape == "hexagon":
-        center = size // 2
-        radius = size // 2 - 10
-        points = [
-            (
-                center + radius * math.cos(math.pi / 3 * i),
-                center + radius * math.sin(math.pi / 3 * i),
-            )
-            for i in range(6)
-        ]
-        draw.polygon(points, fill=255)
-
+def rounded_mask(size, radius):
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, size[0] - 1, size[1] - 1), radius=radius, fill=255
+    )
     return mask
 
 
-def random_accent_color():
-    return random.choice([
-        (88, 166, 255),
-        (138, 180, 248),
-        (156, 163, 255),
-        (200, 200, 220),
-        (180, 190, 254),
-        (120, 200, 255),
-        (165, 177, 255),
-        (255, 170, 128),
-        (255, 138, 180),
-        (148, 226, 213),
-    ])
+def format_duration(duration):
+    duration = str(duration or "Unknown")
+    parts = duration.split(":")
+    if len(parts) == 2 and all(part.isdigit() for part in parts):
+        return f"{int(parts[0])}:{parts[1].zfill(2)}"
+    if len(parts) == 3 and all(part.isdigit() for part in parts):
+        return f"{int(parts[0])}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
+    return duration
 
 
-def add_particles(draw, accent_color):
-    for _ in range(random.randint(15, 30)):
-        x = random.randint(0, CANVAS_W)
-        y = random.randint(0, CANVAS_H)
-        size = random.randint(1, 4)
-        alpha = random.randint(40, 120)
+async def fetch_thumbnail(url, videoid):
+    """Download thumbnail and return its cache path, or None."""
+    if not url:
+        return None
 
-        draw.ellipse(
-            [x, y, x + size, y + size],
-            fill=(*accent_color, alpha)
-        )
-
-
-def add_accent_elements(draw, layout, accent_color):
-    style = layout["accent_style"]
-
-    if style == "line":
-        y = random.randint(100, 200)
-        x = random.randint(30, 100)
-        length = random.randint(200, 400)
-
-        draw.line(
-            [(x, y), (x + length, y)],
-            fill=(*accent_color, 180),
-            width=random.randint(2, 4)
-        )
-
-    elif style == "dot":
-        for _ in range(random.randint(3, 8)):
-            x = random.randint(40, CANVAS_W - 40)
-            y = random.randint(40, CANVAS_H - 40)
-            size = random.randint(4, 10)
-
-            draw.ellipse(
-                [x, y, x + size, y + size],
-                fill=(*accent_color, 100)
-            )
-
-    elif style == "wave":
-        y_start = random.randint(80, 150)
-
-        for x in range(0, CANVAS_W, 3):
-            y = y_start + int(math.sin(x / 50) * 20)
-
-            draw.ellipse(
-                [x, y, x + 2, y + 2],
-                fill=(*accent_color, 60)
-            )
+    path = CACHE_DIR / f"thumb_{videoid}.jpg"
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return None
+                content = await response.read()
+                if not content:
+                    return None
+                async with aiofiles.open(path, "wb") as file:
+                    await file.write(content)
+        return path
+    except Exception as exc:
+        print(f"[gen_thumb] Thumbnail download failed: {exc}")
+        return None
 
 
-def add_glow_ring(canvas, x, y, size, color, blur_amount):
-    ring_size = size + 30
-    ring_img = Image.new("RGBA", (ring_size, ring_size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(ring_img)
 
-    for i in range(5):
-        offset = i * 5
-        alpha = 150 - i * 30
+async def fetch_fixed_default_thumbnail():
+    """Download/cache the user's chosen artwork; use it for every song."""
+    if DEFAULT_THUMB_CACHE.exists() and DEFAULT_THUMB_CACHE.stat().st_size > 0:
+        return DEFAULT_THUMB_CACHE
 
-        draw.ellipse(
-            [offset, offset, ring_size - offset, ring_size - offset],
-            outline=(*color, alpha),
-            width=3
-        )
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(DEFAULT_THUMB_URL) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Default image returned HTTP {response.status}")
+                content = await response.read()
+                if not content:
+                    raise RuntimeError("Default image response was empty")
+                async with aiofiles.open(DEFAULT_THUMB_CACHE, "wb") as file:
+                    await file.write(content)
+        # Validate the downloaded file before relying on it.
+        with Image.open(DEFAULT_THUMB_CACHE) as image:
+            image.verify()
+        return DEFAULT_THUMB_CACHE
+    except Exception as exc:
+        print(f"[gen_thumb] Fixed default image download failed: {exc}")
+        try:
+            if DEFAULT_THUMB_CACHE.exists():
+                DEFAULT_THUMB_CACHE.unlink()
+        except OSError:
+            pass
+        return Path(DEFAULT_THUMB) if Path(DEFAULT_THUMB).exists() else None
 
-    ring_img = ring_img.filter(
-        ImageFilter.GaussianBlur(blur_amount)
+
+def draw_pill(draw, xy, text, fill, font):
+    x1, y1, x2, y2 = xy
+    draw.rounded_rectangle(xy, radius=(y2 - y1) // 2, fill=fill)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_h = bbox[3] - bbox[1]
+    draw.text(
+        (x1 + 18, y1 + ((y2 - y1) - text_h) // 2 - bbox[1]),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
     )
 
-    canvas.paste(ring_img, (x - 15, y - 15), ring_img)
+
+def build_thumbnail(base_img, videoid, title, duration, views, channel):
+    """Render the final premium-style 1320x760 thumbnail."""
+    bg_top, bg_bottom, accent = random.choice(PALETTES)
+    canvas = make_gradient((CANVAS_W, CANVAS_H), bg_top, bg_bottom)
+
+    # Use the cover as a subtle blurred background to add depth.
+    try:
+        backdrop = cover_crop(base_img, (CANVAS_W, CANVAS_H)).filter(
+            ImageFilter.GaussianBlur(34)
+        )
+        backdrop = ImageEnhance.Brightness(backdrop).enhance(0.24)
+        shade = Image.new("RGBA", canvas.size, (*bg_top, 150))
+        canvas = Image.alpha_composite(backdrop, shade)
+        canvas = Image.alpha_composite(canvas, make_gradient(
+            (CANVAS_W, CANVAS_H), (*bg_top, 205), (*bg_bottom, 175)
+        ))
+    except Exception:
+        pass
+
+    draw = ImageDraw.Draw(canvas, "RGBA")
+
+    # Gentle accent blobs and a restrained border.
+    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((70, 80, 620, 630), fill=(*accent, 45))
+    gd.ellipse((900, 200, 1450, 750), fill=(*accent, 25))
+    glow = glow.filter(ImageFilter.GaussianBlur(75))
+    canvas = Image.alpha_composite(canvas, glow)
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    draw.rounded_rectangle(
+        (20, 20, CANVAS_W - 21, CANVAS_H - 21),
+        radius=30, outline=(*accent, 105), width=2
+    )
+
+    # Artwork panel with a shadow and a rounded cover image.
+    art_size = 510
+    art_x, art_y = 70, (CANVAS_H - art_size) // 2 + 15
+    shadow = Image.new("RGBA", (art_size + 50, art_size + 50), (0, 0, 0, 0))
+    sd = ImageDraw.Draw(shadow)
+    sd.rounded_rectangle(
+        (20, 20, art_size + 20, art_size + 20),
+        radius=34, fill=(0, 0, 0, 175)
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(18))
+    canvas.alpha_composite(shadow, (art_x - 25, art_y - 25))
+
+    art = cover_crop(base_img, (art_size, art_size))
+    art.putalpha(rounded_mask((art_size, art_size), 30))
+    canvas.alpha_composite(art, (art_x, art_y))
+
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    draw.rounded_rectangle(
+        (art_x, art_y, art_x + art_size, art_y + art_size),
+        radius=30, outline=(*accent, 220), width=4
+    )
+
+    # Text panel.
+    panel_x = 650
+    panel_right = CANVAS_W - 70
+    max_width = panel_right - panel_x
+
+    brand = str(getattr(app, "username", None) or "ShrutiMusic").lstrip("@")
+    brand_font = fit_text(draw, brand, FONT_BOLD_PATH, 38, max_width, 24)
+    draw.text((panel_x + 2, 48 + 3), brand, font=brand_font, fill=(0, 0, 0, 170))
+    draw.text((panel_x, 48), brand, font=brand_font, fill=(255, 255, 255, 245))
+    brand_bbox = draw.textbbox((panel_x, 48), brand, font=brand_font)
+    underline_y = brand_bbox[3] + 12
+    draw.rounded_rectangle(
+        (panel_x, underline_y, panel_x + 95, underline_y + 5),
+        radius=3, fill=(*accent, 255)
+    )
+
+    pill_font = load_font(FONT_BOLD_PATH, 23)
+    draw_pill(
+        draw, (panel_x, 145, panel_x + 245, 195),
+        "♫  NOW PLAYING", (*accent, 220), pill_font
+    )
+
+    title = str(title or "Unknown title").strip()
+    title_font = load_font(FONT_BOLD_PATH, 49)
+    title_lines = wrap_text(draw, title, title_font, max_width, max_lines=3)
+    title_y = 225
+    line_gap = 13
+    for line in title_lines:
+        # Reduce the font if a single unbroken word is too long.
+        line_font = fit_text(draw, line, FONT_BOLD_PATH, 49, max_width, 27)
+        draw.text((panel_x + 2, title_y + 3), line, font=line_font, fill=(0, 0, 0, 175))
+        draw.text((panel_x, title_y), line, font=line_font, fill=(255, 255, 255, 255))
+        bbox = draw.textbbox((panel_x, title_y), line, font=line_font)
+        title_y = bbox[3] + line_gap
+
+    # Metadata divider and three compact rows.
+    divider_y = min(max(title_y + 14, 425), 500)
+    draw.line(
+        (panel_x, divider_y, panel_right, divider_y),
+        fill=(255, 255, 255, 65), width=2
+    )
+
+    duration = format_duration(duration)
+    metadata = [
+        ("VIEWS", str(views or "Unknown")),
+        ("DURATION", duration),
+        ("CHANNEL", str(channel or "Unknown channel")),
+    ]
+    label_font = load_font(FONT_BOLD_PATH, 17)
+    value_font = load_font(FONT_REGULAR_PATH, 24)
+    row_y = divider_y + 22
+    row_gap = 61
+
+    for label, value in metadata:
+        # Avoid a long channel name running beyond the right edge.
+        value_font_fit = fit_text(draw, value, FONT_REGULAR_PATH, 24, max_width, 17)
+        draw.text((panel_x, row_y), label, font=label_font, fill=(*accent, 255))
+        value_y = row_y + 22
+        draw.text((panel_x + 1, value_y + 1), value, font=value_font_fit, fill=(0, 0, 0, 140))
+        draw.text((panel_x, value_y), value, font=value_font_fit, fill=(232, 237, 245, 255))
+        row_y += row_gap
+
+    # Small decorative equalizer at bottom right.
+    eq_x = panel_right - 100
+    eq_base = CANVAS_H - 58
+    for i, height in enumerate((18, 34, 24, 46, 28, 38, 16)):
+        x = eq_x + i * 13
+        draw.rounded_rectangle(
+            (x, eq_base - height, x + 7, eq_base),
+            radius=2, fill=(*accent, 200 if i in (1, 3, 5) else 100)
+        )
+
+    output = CACHE_DIR / f"{videoid}_final.png"
+    canvas.convert("RGB").save(output, format="PNG", optimize=True)
+    return str(output)
 
 
 async def gen_thumb(videoid: str):
-    thumb_path = None
+    """
+    Generate a music thumbnail and return its local path.
+    This keeps the original function signature expected by the bot.
+    """
+    videoid = str(videoid or "").strip()
+    if not videoid:
+        print("[gen_thumb] Empty video ID")
+        return None
 
-    # Default values: used when YouTube information cannot be fetched.
-    title = BOT_BRAND
+    thumb_path = None
+    base_img = None
+    title = "Unknown title"
     duration = "Unknown"
-    views = "Unknown Views"
-    channel = BOT_BRAND
+    views = "Unknown"
+    channel = "Unknown channel"
 
     try:
         url = f"https://www.youtube.com/watch?v={videoid}"
-        results = VideosSearch(url, limit=1)
-        search_data = await results.next()
-        result_list = search_data.get("result", [])
+        search = VideosSearch(url, limit=1)
+        response = await search.next()
+        results = (response or {}).get("result") or []
+        if not results:
+            raise ValueError("No YouTube search result returned")
 
-        if not result_list:
-            raise ValueError("No YouTube result found")
+        result = results[0]
+        title = result.get("title") or title
+        duration = result.get("duration") or duration
+        views = (result.get("viewCount") or {}).get("short") or views
+        channel = (result.get("channel") or {}).get("name") or channel
 
-        result = result_list[0]
-
-        title = result.get("title") or BOT_BRAND
-        duration = result.get("duration") or "Unknown"
-        views = result.get("viewCount", {}).get("short") or "Unknown Views"
-        channel = result.get("channel", {}).get("name") or BOT_BRAND
-
-        thumbnails = result.get("thumbnails", [])
-
-        if thumbnails:
-            thumb_url = thumbnails[0].get("url", "").split("?")[0]
-
-            if thumb_url:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            thumb_url,
-                            timeout=aiohttp.ClientTimeout(total=15)
-                        ) as response:
-
-                            if response.status == 200:
-                                image_data = await response.read()
-
-                                candidate = CACHE_DIR / f"thumb{videoid}.png"
-
-                                async with aiofiles.open(candidate, "wb") as f:
-                                    await f.write(image_data)
-
-                                # Verify that the downloaded image is valid.
-                                with Image.open(candidate) as test_image:
-                                    test_image.verify()
-
-                                thumb_path = candidate
-
-                except Exception as e:
-                    print(f"[Agni Music] YouTube thumbnail unavailable: {e}")
-
-    except Exception as e:
-        print(f"[Agni Music] YouTube information unavailable: {e}")
-
-        # Fallback details
-        title = BOT_BRAND
-        duration = "Unknown"
-        views = "Unknown Views"
-        channel = BOT_BRAND
-
-    # Use YouTube thumbnail when valid; otherwise use Agni Music image.
-    try:
-        if thumb_path and thumb_path.exists():
-            with Image.open(thumb_path) as image:
-                base_img = image.convert("RGBA")
+        # Always use the same artwork URL supplied by the user for every song.
+        # YouTube thumbnails are intentionally ignored.
+        thumb_path = await fetch_fixed_default_thumbnail()
+        if thumb_path and Path(thumb_path).exists():
+            with Image.open(thumb_path) as source:
+                base_img = source.convert("RGBA")
         else:
-            with Image.open(DEFAULT_THUMB) as image:
-                base_img = image.convert("RGBA")
-
-    except Exception as e:
-        print(f"[Agni Music] Cannot load thumbnail image: {e}")
-        traceback.print_exc()
-        return None
-
-    try:
-        canvas = Image.new(
-            "RGBA",
-            (CANVAS_W, CANVAS_H),
-            (0, 0, 0, 255)
-        )
-
-        canvas = apply_gradient(canvas, random_gradient())
-
-        layout = random_layout()
-        accent_color = random_accent_color()
-
-        if layout["show_particles"]:
-            add_particles(ImageDraw.Draw(canvas), accent_color)
-            canvas = canvas.filter(ImageFilter.GaussianBlur(1))
-
-        art_size = layout["art_size"]
-        art_x = layout["art_x"]
-        art_y = (CANVAS_H - art_size) // 2
-
-        mask = create_shape_mask(art_size, layout["art_shape"])
-        art = base_img.resize((art_size, art_size), Image.LANCZOS)
-        art.putalpha(mask)
-
-        if random.choice([True, False]):
-            add_glow_ring(
-                canvas,
-                art_x,
-                art_y,
-                art_size,
-                accent_color,
-                random.randint(8, 15)
+            raise FileNotFoundError(
+                "Could not load the configured default thumbnail image."
             )
 
-        canvas.paste(art, (art_x, art_y), art)
-
-        draw = ImageDraw.Draw(canvas)
-        add_accent_elements(draw, layout, accent_color)
-
-        # Always show Agni Music branding instead of the Telegram username.
-        brand_font = ImageFont.truetype(
-            FONT_BOLD_PATH,
-            random.randint(36, 48)
-        )
-
-        brand_x = 35
-        brand_y = 30
-        shadow_offset = 2
-
-        draw.text(
-            (brand_x + shadow_offset, brand_y + shadow_offset),
-            BOT_BRAND,
-            fill=(0, 0, 0, 150),
-            font=brand_font
-        )
-
-        draw.text(
-            (brand_x, brand_y),
-            BOT_BRAND,
-            fill=(255, 255, 255, 255),
-            font=brand_font
-        )
-
-        brand_bbox = draw.textbbox(
-            (brand_x, brand_y),
-            BOT_BRAND,
-            font=brand_font
-        )
-
-        brand_width = brand_bbox[2] - brand_bbox[0]
-        underline_y = brand_bbox[3] + 6
-
-        draw.line(
-            [(brand_x, underline_y), (brand_x + brand_width, underline_y)],
-            fill=(*accent_color, 200),
-            width=3
-        )
-
-        if layout["text_align"] == "right":
-            info_x = art_x + art_size + random.randint(60, 100)
-            max_text_w = CANVAS_W - info_x - 50
-        else:
-            info_x = random.randint(50, 100)
-            max_text_w = art_x - info_x - 50
-
-        np_text = random.choice([
-            "NOW PLAYING",
-            "PLAYING NOW",
-            "NOW PLAYING",
-            "PLAYING",
-        ])
-
-        np_font = ImageFont.truetype(
-            FONT_BOLD_PATH,
-            random.randint(50, 70)
-        )
-
-        np_y = random.randint(120, 160)
-
-        draw.text(
-            (info_x + 3, np_y + 3),
-            np_text,
-            fill=(0, 0, 0, 180),
-            font=np_font
-        )
-
-        draw.text(
-            (info_x, np_y),
-            np_text,
-            fill=(*accent_color, 255),
-            font=np_font
-        )
-
-        title_font = ImageFont.truetype(
-            FONT_BOLD_PATH,
-            random.randint(36, 48)
-        )
-
-        title_lines = wrap_text(
-            draw,
-            title,
-            title_font,
-            max(100, max_text_w)
-        )
-
-        title_text = "\n".join(title_lines)
-        title_y = np_y + random.randint(70, 100)
-
-        draw.multiline_text(
-            (info_x + 2, title_y + 2),
-            title_text,
-            fill=(0, 0, 0, 160),
-            font=title_font,
-            spacing=10
-        )
-
-        draw.multiline_text(
-            (info_x, title_y),
-            title_text,
-            fill=(255, 255, 255, 255),
-            font=title_font,
-            spacing=10
-        )
-
-        meta_font = ImageFont.truetype(
-            FONT_REGULAR_PATH,
-            random.randint(28, 36)
-        )
-
-        meta_y = title_y + 130
-        line_spacing = 50
-
-        duration_label = duration
-
-        if duration and ":" in duration:
-            parts = duration.split(":")
-
-            if len(parts) == 2 and parts[0].isdigit():
-                duration_label = f"{parts[0]}m {parts[1]}s"
-
-        meta_items = [
-            f"Views {views}",
-            f"Duration {duration_label}",
-            f"Channel {channel}",
-        ]
-
-        for index, item in enumerate(meta_items):
-            y = meta_y + index * line_spacing
-
-            draw.text(
-                (info_x + 1, y + 1),
-                item,
-                fill=(0, 0, 0, 140),
-                font=meta_font
-            )
-
-            draw.text(
-                (info_x, y),
-                item,
-                fill=(220, 220, 230, 255),
-                font=meta_font
-            )
-
-        if random.choice([True, False]):
-            size = random.randint(30, 50)
-            width = random.randint(2, 4)
-            color = (*accent_color, 120)
-
-            draw.line(
-                [(25, 25), (25 + size, 25)],
-                fill=color,
-                width=width
-            )
-
-            draw.line(
-                [(25, 25), (25, 25 + size)],
-                fill=color,
-                width=width
-            )
-
-            draw.line(
-                [(CANVAS_W - 25, 25), (CANVAS_W - 25 - size, 25)],
-                fill=color,
-                width=width
-            )
-
-            draw.line(
-                [(CANVAS_W - 25, 25), (CANVAS_W - 25, 25 + size)],
-                fill=color,
-                width=width
-            )
-
-        output_path = CACHE_DIR / f"{videoid}_final.png"
-        canvas.save(output_path, optimize=True)
-
-        if thumb_path and thumb_path.exists():
+    except Exception as exc:
+        print(f"[gen_thumb] YouTube metadata/image fallback: {exc}")
+        if base_img is None and Path(DEFAULT_THUMB).exists():
             try:
-                os.remove(thumb_path)
-            except OSError:
-                pass
+                with Image.open(DEFAULT_THUMB) as source:
+                    base_img = source.convert("RGBA")
+            except Exception:
+                traceback.print_exc()
 
-        return str(output_path)
+        if base_img is None:
+            print("[gen_thumb] No usable thumbnail image; returning None")
+            return None
 
-    except Exception as e:
-        print(f"[Agni Music Thumbnail Processing Error] {e}")
+    try:
+        output_path = build_thumbnail(
+            base_img=base_img,
+            videoid=videoid,
+            title=title,
+            duration=duration,
+            views=views,
+            channel=channel,
+        )
+        return output_path
+    except Exception as exc:
+        print(f"[gen_thumb] Rendering failed: {exc}")
         traceback.print_exc()
         return None
-        
-        
+    finally:
+        # Keep the fixed default image cached so every song uses it without
+        # downloading it again. Do not remove DEFAULT_THUMB_CACHE here.
+        pass
